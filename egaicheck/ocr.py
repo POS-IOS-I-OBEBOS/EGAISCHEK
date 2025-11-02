@@ -4,26 +4,41 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import requests
-from bs4 import BeautifulSoup
+from PIL import Image
+from pylibdmtx.pylibdmtx import decode
 
 LOGGER = logging.getLogger(__name__)
 
-ZXING_ENDPOINT = "https://zxing.org/w/decode"
+
+def _decode_payload(data: bytes | None) -> str:
+    """Decode bytes returned by :func:`pylibdmtx.pylibdmtx.decode`.
+
+    The ZXing service previously returned UTF-8 text.  We preserve this
+    behaviour by attempting to decode using UTF-8 first and falling back to
+    Windows-1251 which is commonly used in Russian EGAIS codes.
+    """
+
+    if not data:
+        return ""
+
+    for encoding in ("utf-8", "cp1251", "latin-1"):
+        try:
+            return data.decode(encoding).strip()
+        except UnicodeDecodeError:
+            continue
+    # ``latin-1`` never raises ``UnicodeDecodeError`` so this line is mostly
+    # defensive, but it keeps ``mypy`` happy and signals an empty result when
+    # nothing sensible could be decoded.
+    return ""
 
 
 def decode_mark_from_image(image_path: Path, timeout: int = 30) -> str:
-    """Decode a DataMatrix mark from an image.
-
-    The implementation relies on the public ZXing web decoder because the
-    official EGAIS check expects a textual representation of the mark. The
-    service returns an HTML document where the decoded payload is embedded
-    into a ``<pre>`` tag.  The function extracts the text and returns the
-    first non-empty line.
+    """Decode a DataMatrix mark from an image using :mod:`pylibdmtx`.
 
     Args:
         image_path: Path to the image file provided by the Telegram user.
-        timeout: Number of seconds to wait for the remote service.
+        timeout: Kept for backward compatibility; ignored because decoding is
+            performed locally.
 
     Returns:
         The decoded mark as a string.
@@ -32,28 +47,24 @@ def decode_mark_from_image(image_path: Path, timeout: int = 30) -> str:
         RuntimeError: If the mark cannot be decoded.
     """
 
-    LOGGER.info("Decoding mark from %s via ZXing service", image_path)
-    with Path(image_path).open("rb") as image_file:
-        files = {"f": (image_path.name, image_file, "application/octet-stream")}
-        data = {"full": "true"}
-        response = requests.post(ZXING_ENDPOINT, files=files, data=data, timeout=timeout)
+    del timeout  # ``timeout`` is ignored but preserved for API compatibility.
+
+    LOGGER.info("Decoding mark from %s via pylibdmtx", image_path)
 
     try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        raise RuntimeError("Не удалось декодировать марку через сервис ZXing.") from exc
+        with Image.open(Path(image_path)) as image:
+            decoded_symbols = decode(image)
+    except (FileNotFoundError, OSError) as exc:  # pragma: no cover - pass-through errors
+        raise RuntimeError("Не удалось открыть изображение для декодирования DataMatrix.") from exc
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    pre_block = soup.find("pre")
-    if not pre_block:
-        raise RuntimeError("Сервис ZXing не вернул текст с расшифровкой марки.")
+    if not decoded_symbols:
+        raise RuntimeError("Не удалось распознать DataMatrix код на изображении.")
 
-    text = pre_block.get_text("\n").strip()
-    for line in text.splitlines():
-        cleaned = line.strip()
-        if cleaned:
-            LOGGER.debug("Decoded mark: %s", cleaned)
-            return cleaned
+    for symbol in decoded_symbols:
+        payload = _decode_payload(symbol.data)
+        if payload:
+            LOGGER.debug("Decoded mark: %s", payload)
+            return payload
 
-    raise RuntimeError("Не удалось найти расшифрованный код марки в ответе ZXing.")
+    raise RuntimeError("Не удалось получить содержимое DataMatrix кода.")
 
