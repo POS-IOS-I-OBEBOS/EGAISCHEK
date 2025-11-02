@@ -2,6 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+import configparser
+import logging
+import sys
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
+try:
+    from tkinter import Tk
+    from tkinter.simpledialog import askstring
+except Exception:  # pragma: no cover - GUI import may fail in headless environments
+    Tk = None  # type: ignore[assignment]
+    askstring = None  # type: ignore[assignment]
+
 import logging
 from getpass import getpass
 from pathlib import Path
@@ -22,6 +35,22 @@ from telegram.ext import (
 from .check_client import Check1FsrarClient, PendingCheck
 from .ocr import decode_mark_from_image
 
+LOG_FILE = Path(__file__).resolve().parent.parent / "egaicheck.log"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(stream=sys.stdout),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+LOGGER = logging.getLogger(__name__)
+
+CONFIG_DIR = Path.home() / ".egaicheck"
+CONFIG_PATH = CONFIG_DIR / "config.ini"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +58,8 @@ WAITING_FOR_PHOTO, WAITING_FOR_CAPTCHA = range(2)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.message:
+        LOGGER.info("Пользователь %s начал проверку", update.message.from_user.id if update.message.from_user else "unknown")
     await update.message.reply_text(
         "Здравствуйте! Отправьте фотографию или скан марки ЕГАИС, чтобы я мог её проверить."
     )
@@ -43,6 +74,8 @@ async def request_photo_again(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not update.message:
         return await request_photo_again(update, context)
+
+    LOGGER.info("Получено изображение для проверки от пользователя %s", update.message.from_user.id if update.message.from_user else "unknown")
 
     telegram_file = None
     if update.message.photo:
@@ -91,6 +124,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             )
         ),
     )
+    LOGGER.info("Пользователю %s отправлена капча для проверки", update.message.from_user.id if update.message.from_user else "unknown")
     return WAITING_FOR_CAPTCHA
 
 
@@ -112,6 +146,8 @@ async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     client: Check1FsrarClient = session_data["client"]
     pending: PendingCheck = session_data["pending"]
 
+    LOGGER.info("Получен ответ на капчу от пользователя %s", update.message.from_user.id if update.message.from_user else "unknown")
+
     try:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, client.submit_check, pending, captcha_value)
@@ -131,16 +167,90 @@ async def handle_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         formatted = str(result)
 
+    LOGGER.info("Отправлен результат проверки пользователю %s", update.message.from_user.id if update.message.from_user else "unknown")
     await update.message.reply_text(formatted)
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("session", None)
+    if update.message:
+        LOGGER.info("Пользователь %s отменил проверку", update.message.from_user.id if update.message.from_user else "unknown")
     await update.message.reply_text("Проверка прервана. Отправьте /start, чтобы начать заново.")
     return ConversationHandler.END
 
 
+def _load_token_from_config() -> str | None:
+    if not CONFIG_PATH.exists():
+        LOGGER.info("Конфигурационный файл токена не найден, потребуется ввод")
+        return None
+
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONFIG_PATH, encoding="utf-8")
+    except OSError:
+        LOGGER.warning("Не удалось прочитать конфигурационный файл токена")
+        return None
+
+    token = parser.get("telegram", "token", fallback="").strip()
+    if not token:
+        LOGGER.info("В конфигурации отсутствует токен, потребуется ввод")
+        return None
+
+    LOGGER.info("Токен бота получен из конфигурационного файла")
+    return token
+
+
+def _save_token_to_config(token: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    parser = configparser.ConfigParser()
+    parser["telegram"] = {"token": token}
+
+    with CONFIG_PATH.open("w", encoding="utf-8") as config_file:
+        parser.write(config_file)
+
+    LOGGER.info("Токен сохранён в конфигурационном файле %s", CONFIG_PATH)
+
+
+def _prompt_token_gui() -> str:
+    if Tk is None or askstring is None:
+        raise RuntimeError("GUI token prompt is not available")
+
+    LOGGER.info("Запуск окна ввода токена")
+    token: str | None = None
+
+    while not token:
+        root = Tk()
+        root.withdraw()
+        try:
+            token = askstring("Telegram Bot", "Введите токен Telegram-бота:", show="*")
+        finally:
+            root.destroy()
+
+        if token is None:
+            raise RuntimeError("Token input cancelled by user")
+
+        token = token.strip()
+
+    LOGGER.info("Токен успешно введён через графическое окно")
+    return token
+
+
+def prompt_token() -> str:
+    token = _load_token_from_config()
+    if token:
+        return token
+
+    try:
+        token = _prompt_token_gui()
+    except Exception:  # noqa: BLE001 - we want to fallback to CLI input
+        LOGGER.exception("Не удалось запросить токен через графический интерфейс, запрашиваем в консоли")
+        token = ""
+        while not token:
+            token = input("Введите токен Telegram-бота: ").strip()
+
+    _save_token_to_config(token)
 def prompt_token() -> str:
     token = ""
     while not token:
@@ -172,6 +282,7 @@ def main() -> None:
     app.add_handler(conversation)
     app.add_handler(CommandHandler("cancel", cancel))
 
+    LOGGER.info("Запуск бота. Логи пишутся в %s", LOG_FILE)
     LOGGER.info("Starting bot polling")
     app.run_polling(close_loop=False)
 
