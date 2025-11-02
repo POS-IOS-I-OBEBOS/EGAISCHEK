@@ -15,6 +15,11 @@ except Exception:  # pragma: no cover - GUI import may fail in headless environm
     Tk = None  # type: ignore[assignment]
     askstring = None  # type: ignore[assignment]
 
+import logging
+from getpass import getpass
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+
 from telegram import Update
 from telegram.ext import (
     AIORateLimiter,
@@ -45,6 +50,9 @@ LOGGER = logging.getLogger(__name__)
 
 CONFIG_DIR = Path.home() / ".egaicheck"
 CONFIG_PATH = CONFIG_DIR / "config.ini"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+LOGGER = logging.getLogger(__name__)
 
 WAITING_FOR_PHOTO, WAITING_FOR_CAPTCHA = range(2)
 
@@ -243,6 +251,10 @@ def prompt_token() -> str:
             token = input("Введите токен Telegram-бота: ").strip()
 
     _save_token_to_config(token)
+def prompt_token() -> str:
+    token = ""
+    while not token:
+        token = getpass("Введите токен Telegram-бота: ").strip()
     return token
 
 
@@ -271,6 +283,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cancel))
 
     LOGGER.info("Запуск бота. Логи пишутся в %s", LOG_FILE)
+    LOGGER.info("Starting bot polling")
     app.run_polling(close_loop=False)
 
 
