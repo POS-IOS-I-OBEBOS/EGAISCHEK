@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import mimetypes
 from pathlib import Path
 
 from PIL import Image
@@ -50,6 +51,15 @@ def decode_mark_from_image(image_path: Path, timeout: int = 30) -> str:
     del timeout  # ``timeout`` is ignored but preserved for API compatibility.
 
     LOGGER.info("Decoding mark from %s via pylibdmtx", image_path)
+    LOGGER.info("Decoding mark from %s via ZXing service", image_path)
+    mime_type, _ = mimetypes.guess_type(image_path.name)
+    if mime_type is None:
+        mime_type = "image/jpeg"
+
+    with Path(image_path).open("rb") as image_file:
+        files = {"f": (image_path.name, image_file, mime_type)}
+        data = {"full": "true"}
+        response = requests.post(ZXING_ENDPOINT, files=files, data=data, timeout=timeout)
 
     try:
         with Image.open(Path(image_path)) as image:
